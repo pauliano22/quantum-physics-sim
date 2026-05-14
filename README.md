@@ -1,29 +1,46 @@
-# Quantum Physics Simulation Engine
+# Wormhole Discovery Engine
 
-**An agentically-autotuned, H100-native solver for the time-dependent Schrödinger equation.**
+**A self-driving laboratory for general relativity.**
 
-This project pairs a Triton-based 3D wave-evolution kernel with an autonomous optimization agent (NemoClaw, driven via MCP) that iteratively tunes the kernel for peak throughput on NVIDIA Hopper-class GPUs.
+This repository is an autonomous research stack that searches the space of Morris-Thorne wormhole geometries for solutions that keep the throat open while minimizing exotic-matter (negative-energy) content. A Physics-Informed Neural Network (PINN) parameterizes the redshift function `Φ(r)` and shape function `b(r)`; a NemoClaw agent running inside an OpenShell sandbox autonomously mutates hyperparameters, dispatches parallel sweeps across an NVIDIA Blackwell B200 cluster, and reads back the Einstein-tensor residuals to decide what to try next.
+
+There is no human in the inner loop.
 
 ---
 
-## Engineering Highlights
+## Why This Architecture
 
-### 1. H100-First Kernel Design
-- **Triton 3.x kernels** targeting `sm_90a`, with launch parameters (`BLOCK_X`, `BLOCK_Y`, `BLOCK_Z`, `num_warps`, `num_stages`) exposed as `tl.constexpr` so the autotuner can explore the full SM occupancy surface.
-- 3D stencil layout chosen to maximize **L2 residency** and exploit the H100's enlarged shared memory (228 KB/SM) and **TMA-style** tiled loads.
-- Target workload: complex-valued ψ field updates approximating split-step Schrödinger evolution on grids up to 1024³.
-- Roadmap: FP8 / `wgmma`-backed Hamiltonian application, async copies via the H100 **Tensor Memory Accelerator**, and CUDA-graph capture for sub-µs step launches.
+General relativity is a search problem dressed up as a PDE: the metric ansatz is high-dimensional, the field equations are stiff, and the physically interesting solutions live on a thin manifold defined by energy-condition violations. Brute-force grid search wastes compute; gradient-based PINN training alone gets stuck in pathological local minima. We close the loop: an LLM agent observes which loss components dominate, hypothesizes a fix (deeper net, different SIREN frequency, re-weighted exotic-matter penalty), and dispatches the experiment itself.
 
-### 2. Agentic Autonomy (NemoClaw + MCP)
-Traditional autotuners brute-force a grid. This engine instead exposes the kernel knobs as an **MCP tool surface** (`src/agents/mcp_tools.py`) consumed by NemoClaw running in OpenShell:
+The hardware story matters as much as the algorithm. Every layer of this stack is written to **saturate the B200**.
 
-- `update_simulation_params(...)` — mutate block shape, warp count, pipeline depth, timestep.
-- `trigger_gpu_run(...)` — execute a measured workload on the GPU and return wall-clock, GCells/s, and peak HBM usage.
+---
 
-NemoClaw observes the metric history, reasons about the cost model (occupancy vs. register pressure vs. memory-pipe saturation), and proposes the next configuration. The loop is closed: the agent *reads its own previous benchmarks*, hypothesizes a bottleneck, and tests it — no hard-coded search grid.
+## Hardware Targeting (Blackwell B200)
 
-### 3. Visualization
-PyVista-backed volumetric rendering of |ψ|² (`src/viz/render.py`) for qualitative validation against analytic test cases (Gaussian wavepacket dispersion, harmonic oscillator eigenstates, double-slit interference).
+### HBM3e bandwidth
+The Triton kernel in `src/engine/spacetime_kernel.py` lays out the `(r, θ, φ)` grid with `φ` as the innermost-stride axis. Each warp issues 128-byte coalesced loads; tile shapes (`BLOCK_R`, `BLOCK_TH`, `BLOCK_PH`) are `tl.constexpr` so the autotuner can sweep occupancy against the **8 TB/s HBM3e** roofline.
+
+### TMA (Tensor Memory Accelerator)
+Radial profiles `Φ(r)`, `b(r)`, and their finite-difference neighbors are staged from HBM3e into shared memory via TMA bulk-tensor copies. The kernel's block-pointer construction lowers to `cp.async.bulk.tensor` on `sm_100`, overlapping the load of tile *N+1* with the compute of tile *N* over a deeper async pipeline (`num_stages=4`).
+
+### tcgen05.mma (5th-gen wgmma)
+Where Jacobian assembly during PINN backprop dispatches small dense contractions, 4×4 metric sub-blocks are staged into Tensor Memory (TMEM) and dispatched via `tcgen05.mma`. The diagonal Morris-Thorne metric collapses most contractions to scalar ops, but the MMA path lights up under the curvature-Jacobian and Hessian terms exercised by the autograd graph in `WormholeLoss`.
+
+### NVLink5 distribution
+`OrchestratorAgent.dispatch_sweep()` fans configurations across visible B200s; gradient and metric reductions ride NVLink5 (1.8 TB/s per GPU bidirectional). Each sweep run is independent — the agent uses cross-run parallelism, not data-parallel splits, which makes NVLink saturation a function of how many candidate configs the agent generates per round.
+
+---
+
+## Agentic Stack (NemoClaw + OpenShell)
+
+| Tool                          | Purpose                                                    |
+|-------------------------------|------------------------------------------------------------|
+| `mutate_hyperparams(**kw)`    | Propose a new PINN configuration (width, depth, SIREN ω₀, loss weights, collocation density). |
+| `dispatch_sweep(configs)`     | Run N configs in parallel across the B200 cluster.        |
+| `read_exotic_matter_loss(id)` | Return the integrated null-energy-condition violation for a run; the agent uses this as its primary fitness signal. |
+
+The agent runs under `openshell.toml`, a strict March-2026-alpha policy that grants execute permission only for `src/`-resident Python scripts and read access to `nvidia-smi` for profiling. The agent cannot rewrite its own policy or escape the workspace.
 
 ---
 
@@ -31,23 +48,43 @@ PyVista-backed volumetric rendering of |ψ|² (`src/viz/render.py`) for qualitat
 
 ```
 src/
-  engine/    Triton & CUDA kernels (wave_kernel.py)
-  agents/    NemoClaw MCP tool surface (mcp_tools.py)
-  viz/       PyVista volume rendering (render.py)
-tests/       Analytic validation harness
+  engine/
+    spacetime_kernel.py    # Triton: Einstein-tensor evaluation, TMA-staged
+    pinn_model.py          # SIREN PINN + composite physics loss
+  agents/
+    research_tools.py      # NemoClaw MCP tool surface (OrchestratorAgent)
+  viz/
+    render.py              # PyVista volumetric rendering of |ψ|^2 / ρ_exo
+openshell.toml             # NemoClaw sandbox policy (strict)
+requirements.txt
 ```
+
+## Physics Loss
+
+```
+L = w_b · MSE_Boundary + w_e · MSE_EinsteinFieldEquations + w_x · MSE_ExoticMatter
+```
+
+* **Boundary**: throat closure `b(r₀) = r₀`, flare-out `b'(r₀) < 1`, asymptotic flatness `b/r → 0`.
+* **Einstein**: conservation of the diagonal stress-energy tensor along radial collocation points (sampled with autograd-tracked `r`, so `Φ'`, `Φ''`, `b'` are exact).
+* **Exotic matter**: the network is *penalized* for the magnitude of NEC violation `max(0, -(ρ + p_r))` — this is the term the agent optimizes against to find geometries closest to physical realizability.
 
 ## Quick Start
 
 ```bash
 pip install -r requirements.txt
-python -m src.agents.mcp_tools          # smoke-test the kernel
+python -m src.agents.research_tools     # smoke-test orchestration on one GPU
 ```
 
-Hook the `SimulationTools` class into your MCP server registration to give NemoClaw control of the optimization loop.
+Attach NemoClaw to the workspace, point it at `openshell.toml`, and let it run.
 
-## Why This Matters
+---
 
-Modern HPC and AI codes are bottlenecked not by FLOPs but by **how well a kernel fits the architecture it runs on**. Hopper rewards code that respects its memory hierarchy, async pipelines, and warp-specialization model. This project demonstrates a path where the *kernel author is itself an LLM agent* — one that closes the loop between hypothesis, benchmark, and revision faster than a human can rebuild PyTorch.
+## Why a Recruiter Should Care
 
-The same pattern generalizes to any CUDA/Triton workload where the optimal configuration depends on shape, dtype, and SM-generation — exactly the regime where NVIDIA's stack is hardest to tune by hand.
+This is a single repository that exercises the entire NVIDIA stack vertically:
+- **Triton at the bottom**, written for a specific Blackwell SM generation.
+- **PyTorch autograd** wired into a physics loss with second-order terms.
+- **A reasoning agent at the top** that treats kernel and model hyperparameters as a joint search space.
+
+The shape of the problem — a stiff PDE that needs a smart search policy *and* a saturated memory subsystem to be tractable at all — is exactly the regime where Blackwell-class hardware is most differentiated from the previous generation. A self-driving lab is the only way to use it well.

@@ -1,0 +1,98 @@
+# OpenShell security policy for NemoClaw (March 2026 Alpha schema).
+#
+# This policy is loaded when the NemoClaw agent attaches to the
+# quantum-physics-sim workspace. It is intentionally narrow: the agent
+# is granted exactly the permissions needed to (a) execute the PINN
+# training scripts under src/, and (b) read GPU telemetry via nvidia-smi.
+
+schema_version = "2026.03-alpha"
+policy_name    = "wormhole-discovery-engine"
+strict         = true
+
+[agent]
+name        = "nemoclaw"
+description = "Autonomous PINN orchestrator for Morris-Thorne wormhole discovery"
+sandbox     = "openshell"
+
+# ---- Filesystem -------------------------------------------------------------
+[filesystem]
+default = "deny"
+
+  [[filesystem.rules]]
+  path     = "src/"
+  recursive = true
+  read     = true
+  write    = false      # agent may read and execute source, not modify it
+  execute  = true       # required to launch python scripts under src/
+
+  [[filesystem.rules]]
+  path     = "src/engine/"
+  recursive = true
+  read     = true
+  write    = false
+  execute  = true
+
+  [[filesystem.rules]]
+  path     = "src/agents/"
+  recursive = true
+  read     = true
+  write    = false
+  execute  = true
+
+  [[filesystem.rules]]
+  path     = "runs/"
+  recursive = true
+  read     = true
+  write    = true       # sweep outputs / metrics
+  execute  = false
+
+  [[filesystem.rules]]
+  path     = "openshell.toml"
+  read     = true
+  write    = false      # the agent never edits its own policy
+
+# ---- Process execution ------------------------------------------------------
+[exec]
+default = "deny"
+
+  [[exec.allow]]
+  binary = "python"
+  args_regex = "^-m\\s+src\\.(engine|agents)(\\..+)?$|^src/(engine|agents)/.+\\.py$"
+  description = "Run PINN training and orchestration entry points"
+
+  [[exec.allow]]
+  binary = "python3"
+  args_regex = "^-m\\s+src\\.(engine|agents)(\\..+)?$|^src/(engine|agents)/.+\\.py$"
+
+  [[exec.allow]]
+  binary = "nvidia-smi"
+  args_regex = ".*"
+  description = "GPU profiling and telemetry (B200 cluster health)"
+
+  [[exec.allow]]
+  binary = "nsys"
+  args_regex = "^profile\\s+.+"
+  description = "Nsight Systems profiling for Triton kernel autotuning"
+
+# ---- Network ----------------------------------------------------------------
+[network]
+default = "deny"
+
+  [[network.allow]]
+  host = "127.0.0.1"
+  ports = [29500, 29501, 29502, 29503]    # torch.distributed rendezvous
+  description = "NCCL/Gloo rendezvous over NVLink-attached B200s"
+
+# ---- Resource limits --------------------------------------------------------
+[limits]
+max_processes     = 16
+max_gpu_memory_gb = 180           # one B200 HBM3e bank
+max_wallclock_s   = 7200
+max_open_files    = 1024
+
+# ---- Audit ------------------------------------------------------------------
+[audit]
+log_path        = "runs/openshell-audit.log"
+log_tool_calls  = true
+log_exec        = true
+log_denied      = true
